@@ -1,7 +1,8 @@
 import abc
 
 import torch
-
+import torch.nn as nn
+import torch.nn.functional as F
 
 def load() -> torch.nn.Module:
     from pathlib import Path
@@ -114,22 +115,37 @@ class PatchAutoEncoder(torch.nn.Module, PatchAutoEncoderBase):
 
         def __init__(self, patch_size: int, latent_dim: int, bottleneck: int):
             super().__init__()
-            raise NotImplementedError()
+            self.encoder = nn.Sequential(
+                nn.Conv2d(3, latent_dim, kernel_size=3, stride=2, padding=1),
+                nn.GELU(),
+                nn.Conv2d(latent_dim, bottleneck, kernel_size=3, stride=2, padding=1),
+                nn.GELU(),
+            )
 
         def forward(self, x: torch.Tensor) -> torch.Tensor:
-            raise NotImplementedError()
+            self.encoder(x)
 
     class PatchDecoder(torch.nn.Module):
         def __init__(self, patch_size: int, latent_dim: int, bottleneck: int):
             super().__init__()
-            raise NotImplementedError()
+            self.decoder = nn.Sequential(
+                nn.ConvTranspose2d(bottleneck, latent_dim, kernel_size=4, stride=2, padding=1),
+                nn.GELU(),
+                nn.ConvTranspose2d(latent_dim, 3, kernel_size=4, stride=2, padding=1),
+                nn.Sigmoid(), 
+            )
 
         def forward(self, x: torch.Tensor) -> torch.Tensor:
-            raise NotImplementedError()
+            self.decoder(x)
 
     def __init__(self, patch_size: int = 25, latent_dim: int = 128, bottleneck: int = 128):
         super().__init__()
-        raise NotImplementedError()
+        self.patch_size = patch_size
+        self.latent_dim = latent_dim
+        self.bottleneck = bottleneck
+
+        self.encoder = self.PatchEncoder(patch_size, latent_dim, bottleneck)
+        self.decoder = self.PatchDecoder(patch_size, latent_dim, bottleneck)
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """
@@ -137,10 +153,17 @@ class PatchAutoEncoder(torch.nn.Module, PatchAutoEncoderBase):
         minimize (or even just visualize).
         You can return an empty dictionary if you don't have any additional terms.
         """
-        raise NotImplementedError()
+        z = self.encode(x)
+        x_hat = self.decode(z)
+        additional_losses = {} 
+        return x_hat, additional_losses
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
-        raise NotImplementedError()
+        x = x.permute(0, 3, 1, 2) 
+        z = self.encoder(x)
+        return z.permute(0, 2, 3, 1) 
 
     def decode(self, x: torch.Tensor) -> torch.Tensor:
-        raise NotImplementedError()
+        x = x.permute(0, 3, 1, 2) 
+        x_hat = self.decoder(x)
+        return x_hat.permute(0, 2, 3, 1)
