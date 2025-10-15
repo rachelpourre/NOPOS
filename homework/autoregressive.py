@@ -1,6 +1,8 @@
 import abc
 
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 
 def load() -> torch.nn.Module:
@@ -19,6 +21,22 @@ class Autoregressive(abc.ABC):
     """
 
     @abc.abstractmethod
+    def __init__(self, n_tokens: int = 256, d_model: int = 128):
+        super().__init__()
+        self.n_tokens = n_tokens
+        self.d_model = d_model
+
+        self.embedding = nn.Embedding(n_tokens, d_model)
+
+        self.transformer = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(
+                d_model=d_model, nhead=4, dim_feedforward=512, batch_first=True
+            ),
+            num_layers=4
+        )
+
+        self.head = nn.Linear(d_model, n_tokens)
+
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """
         Take a tensor x (B, h, w) if integers as input.
@@ -34,11 +52,38 @@ class Autoregressive(abc.ABC):
                 values, and before passing them through your model. (torch.concat or
                 torch.nn.ConstantPad1d both work)
         """
+        B, H, W = x.shape
+        seq_len = H * W
+
+        x = x.view(B, seq_len)
+
+        emb = self.embedding(x)  
+
+        start_token = torch.zeros(B, 1, self.d_model, device=x.device)
+        emb_shifted = torch.cat([start_token, emb[:, :-1, :]], dim=1)
+
+        out = self.transformer(emb_shifted)
+
+        logits = self.head(out)
+        logits = logits.view(B, H, W, self.n_tokens)
+
+        return logits, {}
 
     def generate(self, B: int = 1, h: int = 20, w: int = 30, device=None) -> torch.Tensor:  # noqa
         """
         Use your generative model to produce B new token images of size (B, h, w) and type (int/long).
         """
+        if device is None:
+            device = next(self.parameters()).device
+        x = torch.zeros((B, h, w), dtype=torch.long, device=device)
+
+        for i in range(h):
+            for j in range(w):
+                logits, _ = self.forward(x)
+                probs = torch.softmax(logits[:, i, j, :], dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1).squeeze(-1)
+                x[:, i, j] = next_token
+        return x
 
 
 class AutoregressiveModel(torch.nn.Module, Autoregressive):
@@ -55,10 +100,50 @@ class AutoregressiveModel(torch.nn.Module, Autoregressive):
 
     def __init__(self, d_latent: int = 128, n_tokens: int = 2**10):
         super().__init__()
-        raise NotImplementedError()
+        self.n_tokens = n_tokens
+        self.d_latent = d_latent
+
+        self.embedding = nn.Embedding(n_tokens, d_latent)
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_latent,
+            nhead=4,
+            dim_feedforward=4 * d_latent,
+            batch_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=4)
+
+        self.to_logits = nn.Linear(d_latent, n_tokens)
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        raise NotImplementedError()
+        B, H, W = x.shape
+        seq_len = H * W
 
-    def generate(self, B: int = 1, h: int = 30, w: int = 20, device=None) -> torch.Tensor:  # noqa
-        raise NotImplementedError()
+        x = x.view(B, seq_len)
+
+        emb = self.embedding(x)  
+
+        start_token = torch.zeros(B, 1, self.d_latent, device=x.device)
+        emb_shifted = torch.cat([start_token, emb[:, :-1, :]], dim=1)
+
+        encoded = self.transformer(emb_shifted) 
+
+        logits = self.to_logits(encoded) 
+        logits = logits.view(B, H, W, self.n_tokens)
+
+        return logits, {}
+
+    def generate(self, B: int = 1, h: int = 30, w: int = 20, device=None) -> torch.Tensor: 
+        if device is None:
+            device = next(self.parameters()).device
+
+        x = torch.zeros((B, h, w), dtype=torch.long, device=device)
+
+        for i in range(h):
+            for j in range(w):
+                logits, _ = self.forward(x)
+                probs = F.softmax(logits[:, i, j, :], dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1).squeeze(-1)
+                x[:, i, j] = next_token
+
+        return x
