@@ -112,15 +112,36 @@ class BSQPatchAutoEncoder(PatchAutoEncoder, Tokenizer):
         return x_hat.permute(0, 2, 3, 1).contiguous()
 
     def encode_index(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim == 3:
+            x = x.unsqueeze(0)
+            squeeze_batch = True
+        else:
+            squeeze_batch = False
+
         x = x.permute(0, 3, 1, 2).contiguous()
         latent = self.encoder(x)
-        return self.bsq.encode_index(latent)
+        indices = self.bsq.encode_index(latent)
+
+        if squeeze_batch:
+            indices = indices.squeeze(0)
+        return indices
 
     def decode_index(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim == 2:  # single image token map (H,W)
+            x = x.unsqueeze(0)
+            squeeze_batch = True
+        else:
+            squeeze_batch = False
+
         code = self.bsq.decode_index(x)
         x_hat = self.decoder(code)
+        # Optional: crop to expected size (replace with dynamic shape if you like)
         x_hat = x_hat[:, :, :100, :150]
-        return x_hat.permute(0, 2, 3, 1).contiguous()
+        x_hat = x_hat.permute(0, 2, 3, 1).contiguous()
+
+        if squeeze_batch:
+            x_hat = x_hat.squeeze(0)
+        return x_hat
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         x = x.permute(0, 3, 1, 2).contiguous()
