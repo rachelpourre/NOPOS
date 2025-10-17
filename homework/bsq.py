@@ -2,12 +2,20 @@ import abc
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from pathlib import Path
 from .ae import PatchAutoEncoder
 
 
+def load() -> torch.nn.Module:
+    model_name = "BSQPatchAutoEncoder"
+    model_path = Path(__file__).parent / f"{model_name}.pth"
+    print(f"Loading {model_name} from {model_path}")
+    return torch.load(model_path, map_location="cpu", weights_only=False)
+
+
 def diff_sign(x: torch.Tensor) -> torch.Tensor:
-    """Differentiable sign with straight-through estimator."""
-    sign = 2 * (x >= 0).float() - 1
+    """Differentiable sign using straight-through estimator."""
+    sign = (x >= 0).float() * 2 - 1
     return x + (sign - x).detach()
 
 
@@ -19,7 +27,6 @@ class Tokenizer(abc.ABC):
 
 
 class BSQ(nn.Module):
-    """Binary Sign Quantization layer."""
     def __init__(self, codebook_bits: int, embedding_dim: int):
         super().__init__()
         self.codebook_bits = codebook_bits
@@ -27,28 +34,46 @@ class BSQ(nn.Module):
         self.down = nn.Linear(embedding_dim, codebook_bits, bias=False)
         self.up = nn.Linear(codebook_bits, embedding_dim, bias=False)
 
-    @torch.cuda.amp.autocast()
+    #@torch.amp.autocast("cuda")
     def encode(self, x: torch.Tensor) -> torch.Tensor:
+        # Flatten spatial dimensions if present
+        orig_shape = x.shape
+        if x.ndim == 4:
+            x = x.permute(0, 2, 3, 1).reshape(-1, self.embedding_dim)
+        elif x.ndim == 3:
+            x = x.reshape(-1, self.embedding_dim)
         x = self.down(x)
         x = F.normalize(x, dim=-1)
         x = diff_sign(x)
+        # Restore spatial shape
+        if len(orig_shape) == 4:
+            B, C, H, W = orig_shape
+            x = x.view(B, H, W, self.codebook_bits).permute(0, 3, 1, 2)
         return x
 
-    @torch.cuda.amp.autocast()
+    #@torch.amp.autocast("cuda")
     def decode(self, x: torch.Tensor) -> torch.Tensor:
-        return self.up(x)
+        orig_shape = x.shape
+        if x.ndim == 4:
+            x = x.permute(0, 2, 3, 1).reshape(-1, self.codebook_bits)
+        elif x.ndim == 3:
+            x = x.reshape(-1, self.codebook_bits)
+        x = self.up(x)
+        if len(orig_shape) == 4:
+            B, _, H, W = orig_shape
+            x = x.view(B, H, W, self.embedding_dim).permute(0, 3, 1, 2)
+        return x
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.decode(self.encode(x))
 
-    # --- Bitwise index helpers ---
     def _code_to_index(self, x: torch.Tensor) -> torch.Tensor:
-        # Convert -1/1 bits to integers
         bits = (x >= 0).int()
         return (bits * (2 ** torch.arange(self.codebook_bits, device=x.device))).sum(dim=-1)
 
     def _index_to_code(self, x: torch.Tensor) -> torch.Tensor:
-        return 2 * ((x[..., None] & (2 ** torch.arange(self.codebook_bits, device=x.device))) > 0).float() - 1
+        bits = (x[..., None] & (2 ** torch.arange(self.codebook_bits, device=x.device))) > 0
+        return bits.float() * 2 - 1
 
     def encode_index(self, x: torch.Tensor) -> torch.Tensor:
         return self._code_to_index(self.encode(x))
@@ -56,48 +81,56 @@ class BSQ(nn.Module):
     def decode_index(self, x: torch.Tensor) -> torch.Tensor:
         return self.decode(self._index_to_code(x))
 
+
 class BSQPatchAutoEncoder(PatchAutoEncoder, Tokenizer):
+    """Memory-efficient PatchAutoEncoder + BSQ quantizer."""
+
     def __init__(self, patch_size: int = 5, latent_dim: int = 128, codebook_bits: int = 10):
         super().__init__(patch_size=patch_size, latent_dim=latent_dim)
         self.codebook_bits = codebook_bits
-        self.bsq = BSQ(codebook_bits, latent_dim)
+        self.bsq = BSQ(codebook_bits=codebook_bits, embedding_dim=latent_dim)
 
-    @torch.no_grad()
-    def encode_index(self, x: torch.Tensor) -> torch.Tensor:
-        with torch.cuda.amp.autocast():
-            latent = self.encoder(x)
-            tokens = self.bsq.encode_index(latent)
-        return tokens
-
-    @torch.no_grad()
-    def decode_index(self, x: torch.Tensor) -> torch.Tensor:
-        with torch.cuda.amp.autocast():
-            code = self.bsq.decode_index(x)
-            recon = self.decoder(code)
-        return recon
-
+    #@torch.amp.autocast("cuda")
     def encode(self, x: torch.Tensor) -> torch.Tensor:
+        # Convert (B, H, W, C) → (B, C, H, W)
+        x = x.permute(0, 3, 1, 2).contiguous()
         latent = self.encoder(x)
         return self.bsq.encode(latent)
 
+    #@torch.amp.autocast("cuda")
     def decode(self, x: torch.Tensor) -> torch.Tensor:
         decoded = self.bsq.decode(x)
-        return self.decoder(decoded)
+        x_hat = self.decoder(decoded)
+        # Convert back (B, C, H, W) → (B, H, W, C)
+        return x_hat.permute(0, 2, 3, 1).contiguous()
 
-    def forward(self, x: torch.Tensor):
-        """Reconstruct + monitor codebook usage."""
+    def encode_index(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.permute(0, 3, 1, 2).contiguous()
         latent = self.encoder(x)
-        code = self.bsq.encode(latent)
-        recon = self.decoder(self.bsq.decode(code))
+        return self.bsq.encode_index(latent)
 
-        # Optional diagnostics: monitor code usage
+    def decode_index(self, x: torch.Tensor) -> torch.Tensor:
+        code = self.bsq.decode_index(x)
+        x_hat = self.decoder(code)
+        return x_hat.permute(0, 2, 3, 1).contiguous()
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        # (B, H, W, C) → (B, C, H, W)
+        x = x.permute(0, 3, 1, 2).contiguous()
+
+        z = self.encoder(x)
+        zq = self.bsq.encode(z)
+        x_hat = self.decoder(self.bsq.decode(zq))
+
+        # Back to (B, H, W, C)
+        x_hat = x_hat.permute(0, 2, 3, 1).contiguous()
+
+        # Monitor codebook usage
         with torch.no_grad():
-            idx = self.bsq._code_to_index(code)
-            cnt = torch.bincount(idx.flatten(), minlength=2 ** self.codebook_bits)
-            stats = {
-                "cb0": (cnt == 0).float().mean(),
-                "cb2": (cnt <= 2).float().mean(),
-                "entropy": (-((cnt / cnt.sum() + 1e-8) * torch.log2(cnt / cnt.sum() + 1e-8))).sum(),
-            }
+            indices = self.bsq._code_to_index(zq)
+            cnt = torch.bincount(indices.flatten(), minlength=2 ** self.codebook_bits)
+            cb0 = (cnt == 0).float().mean()
+            cb2 = (cnt <= 2).float().mean()
 
-        return recon, stats
+        losses = {"cb0": cb0.detach(), "cb2": cb2.detach()}
+        return x_hat, losses
