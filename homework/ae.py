@@ -116,27 +116,27 @@ class PatchAutoEncoder(torch.nn.Module, PatchAutoEncoderBase):
         def __init__(self, patch_size: int, latent_dim: int, bottleneck: int):
             super().__init__()
             self.encoder = nn.Sequential(
-                nn.Conv2d(3, latent_dim, kernel_size=3, stride=2, padding=1),
+                nn.Conv2d(3, latent_dim, kernel_size=3, stride=2, padding=1),  # keeps even sizes
                 nn.GELU(),
                 nn.Conv2d(latent_dim, bottleneck, kernel_size=3, stride=2, padding=1),
                 nn.GELU(),
             )
 
         def forward(self, x: torch.Tensor) -> torch.Tensor:
-            self.encoder(x)
+            return self.encoder(x)
 
     class PatchDecoder(torch.nn.Module):
-        def __init__(self, patch_size: int, latent_dim: int, bottleneck: int):
+        def __init__(self, patch_size, latent_dim, bottleneck):
             super().__init__()
             self.decoder = nn.Sequential(
-                nn.ConvTranspose2d(bottleneck, latent_dim, kernel_size=4, stride=2, padding=1),
+                nn.ConvTranspose2d(bottleneck, latent_dim, kernel_size=3, stride=2, padding=1, output_padding=1),
                 nn.GELU(),
-                nn.ConvTranspose2d(latent_dim, 3, kernel_size=4, stride=2, padding=1),
-                nn.Sigmoid(), 
+                nn.ConvTranspose2d(latent_dim, 3, kernel_size=3, stride=2, padding=1, output_padding=1),
+                nn.Tanh(),
             )
 
         def forward(self, x: torch.Tensor) -> torch.Tensor:
-            self.decoder(x)
+            return self.decoder(x)
 
     def __init__(self, patch_size: int = 25, latent_dim: int = 128, bottleneck: int = 128):
         super().__init__()
@@ -153,10 +153,11 @@ class PatchAutoEncoder(torch.nn.Module, PatchAutoEncoderBase):
         minimize (or even just visualize).
         You can return an empty dictionary if you don't have any additional terms.
         """
-        z = self.encode(x)
-        x_hat = self.decode(z)
-        additional_losses = {} 
-        return x_hat, additional_losses
+        with torch.cuda.amp.autocast(): 
+            z = self.encode(x)
+            out = self.decode(z)
+            out = out.float()
+        return out, {}
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         x = x.permute(0, 3, 1, 2) 
@@ -166,4 +167,5 @@ class PatchAutoEncoder(torch.nn.Module, PatchAutoEncoderBase):
     def decode(self, x: torch.Tensor) -> torch.Tensor:
         x = x.permute(0, 3, 1, 2) 
         x_hat = self.decoder(x)
+        x_hat = x_hat[:, :, :100, :150]
         return x_hat.permute(0, 2, 3, 1)

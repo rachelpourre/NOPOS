@@ -1,11 +1,13 @@
 import abc
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+import gc
+from torch.utils.checkpoint import checkpoint
 from .ae import PatchAutoEncoder
 
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.set_float32_matmul_precision("medium")
 
 def load() -> torch.nn.Module:
     from pathlib import Path
@@ -51,7 +53,7 @@ class BSQ(torch.nn.Module):
         self._codebook_bits = codebook_bits
         self.embedding_dim = embedding_dim
 
-        self.down = nn.Linear(embedding_dim, codebook_bits) 
+        self.down = nn.Linear(embedding_dim, codebook_bits)
         self.up = nn.Linear(codebook_bits, embedding_dim)
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
@@ -62,12 +64,8 @@ class BSQ(torch.nn.Module):
         - differentiable sign
         """
         x_proj = self.down(x)
-
         x_norm = F.normalize(x_proj, dim=-1)
-
-        x_code = diff_sign(x_norm)
-
-        return x_code
+        return diff_sign(x_norm)
 
     def decode(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -107,7 +105,7 @@ class BSQPatchAutoEncoder(PatchAutoEncoder, Tokenizer):
           Changing the patch-size of codebook-size will complicate later parts of the assignment.
     """
 
-    def __init__(self, patch_size: int = 5, latent_dim: int = 128, codebook_bits: int = 10):
+    def __init__(self, patch_size: int = 15, latent_dim: int = 128, codebook_bits: int = 10):
         super().__init__(patch_size=patch_size, latent_dim=latent_dim)
         self.codebook_bits = codebook_bits
         self.bsq = BSQ(codebook_bits=codebook_bits, embedding_dim=latent_dim)
@@ -125,13 +123,10 @@ class BSQPatchAutoEncoder(PatchAutoEncoder, Tokenizer):
         return img
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
-        z = super().encode(x)      
-        z_q = self.bsq.encode(z)   
-        return z_q
+        return self.bsq.encode(checkpoint(super().encode, x, use_reentrant=False))
 
     def decode(self, x: torch.Tensor) -> torch.Tensor:
-        z_hat = self.bsq.decode(x)  
-        return super().decode(z_hat)
+        return super().decode(self.bsq.decode(x))
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """
@@ -149,14 +144,34 @@ class BSQPatchAutoEncoder(PatchAutoEncoder, Tokenizer):
                 ...
               }
         """
-        z = super().encode(x)
-        z_q = self.bsq.encode(z)
-        recon = super().decode(self.bsq.decode(z_q))
+        is_train = self.training
+        try:
+            if not is_train:
+                # ⚡ Disable grad during validation to save VRAM
+                with torch.no_grad():
+                    z = checkpoint(super().encode, x, use_reentrant=False)
+                    z_q = self.bsq.encode(z)
+                    recon = super().decode(self.bsq.decode(z_q))
+            else:
+                z = checkpoint(super().encode, x, use_reentrant=False)
+                z_q = self.bsq.encode(z)
+                recon = super().decode(self.bsq.decode(z_q))
 
-        cnt = torch.bincount(self.encode_index(x).flatten(), minlength=2**self.codebook_bits)
-        metrics = {
-            "cb0": (cnt == 0).float().mean().detach(),  
-            "cb2": (cnt <= 2).float().mean().detach(),  
-        }
+            torch.cuda.empty_cache()  # <-- Add this line
+            return recon, {}
+        finally:
+            torch.cuda.empty_cache()
 
-        return recon, metrics
+    def on_validation_epoch_end(self):
+        torch.cuda.empty_cache()
+
+    def on_validation_epoch_end(self):
+        _free_gpu_memory()
+
+def _free_gpu_memory():
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+
+_free_gpu_memory()
