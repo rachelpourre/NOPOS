@@ -20,9 +20,12 @@ def diff_sign(x: torch.Tensor) -> torch.Tensor:
 
 class Tokenizer(abc.ABC):
     @abc.abstractmethod
-    def encode_index(self, x: torch.Tensor) -> torch.Tensor: ...
+    def encode_index(self, x: torch.Tensor) -> torch.Tensor:
+        ...
+
     @abc.abstractmethod
-    def decode_index(self, x: torch.Tensor) -> torch.Tensor: ...
+    def decode_index(self, x: torch.Tensor) -> torch.Tensor:
+        ...
 
 
 class BSQ(nn.Module):
@@ -33,31 +36,33 @@ class BSQ(nn.Module):
         self.down = nn.Linear(embedding_dim, codebook_bits, bias=False)
         self.up = nn.Linear(codebook_bits, embedding_dim, bias=False)
 
-    #@torch.amp.autocast("cuda")
+    # @torch.amp.autocast("cuda")
     def encode(self, x: torch.Tensor) -> torch.Tensor:
-        
         orig_shape = x.shape
         if x.ndim == 4:
             x = x.permute(0, 2, 3, 1).reshape(-1, self.embedding_dim)
         elif x.ndim == 3:
             x = x.reshape(-1, self.embedding_dim)
+
         x = self.down(x)
         x = F.normalize(x, dim=-1)
         x = diff_sign(x)
-        
+
         if len(orig_shape) == 4:
             B, C, H, W = orig_shape
             x = x.view(B, H, W, self.codebook_bits).permute(0, 3, 1, 2)
         return x
 
-    #@torch.amp.autocast("cuda")
+    # @torch.amp.autocast("cuda")
     def decode(self, x: torch.Tensor) -> torch.Tensor:
         orig_shape = x.shape
         if x.ndim == 4:
             x = x.permute(0, 2, 3, 1).reshape(-1, self.codebook_bits)
         elif x.ndim == 3:
             x = x.reshape(-1, self.codebook_bits)
+
         x = self.up(x)
+
         if len(orig_shape) == 4:
             B, _, H, W = orig_shape
             x = x.view(B, H, W, self.embedding_dim).permute(0, 3, 1, 2)
@@ -68,10 +73,11 @@ class BSQ(nn.Module):
 
     def _code_to_index(self, x: torch.Tensor) -> torch.Tensor:
         bits = (x >= 0).int()
-
         if bits.ndim == 4:
-            bits = bits.permute(0, 2, 3, 1)  
-        weights = (2 ** torch.arange(self.codebook_bits, device=x.device)).view(1, 1, 1, -1)
+            bits = bits.permute(0, 2, 3, 1)
+        weights = (2 ** torch.arange(self.codebook_bits, device=x.device)).view(
+            1, 1, 1, -1
+        )
         return (bits * weights).sum(dim=-1)
 
     def _index_to_code(self, x: torch.Tensor) -> torch.Tensor:
@@ -82,23 +88,24 @@ class BSQ(nn.Module):
         return self._code_to_index(self.encode(x))
 
     def decode_index(self, x: torch.Tensor) -> torch.Tensor:
-        return self.decode(self._index_to_code(x))
+        code = self._index_to_code(x)  # (B, H, W, codebook_bits)
+        code = code.permute(0, 3, 1, 2).contiguous()  # (B, codebook_bits, H, W)
+        return self.decode(code)
 
 
 class BSQPatchAutoEncoder(PatchAutoEncoder, Tokenizer):
-
     def __init__(self, patch_size: int = 5, latent_dim: int = 128, codebook_bits: int = 10):
         super().__init__(patch_size=patch_size, latent_dim=latent_dim)
         self.codebook_bits = codebook_bits
         self.bsq = BSQ(codebook_bits=codebook_bits, embedding_dim=latent_dim)
 
-    #@torch.amp.autocast("cuda")
+    # @torch.amp.autocast("cuda")
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         x = x.permute(0, 3, 1, 2).contiguous()
         latent = self.encoder(x)
         return self.bsq.encode(latent)
 
-    #@torch.amp.autocast("cuda")
+    # @torch.amp.autocast("cuda")
     def decode(self, x: torch.Tensor) -> torch.Tensor:
         decoded = self.bsq.decode(x)
         x_hat = self.decoder(decoded)
@@ -112,6 +119,7 @@ class BSQPatchAutoEncoder(PatchAutoEncoder, Tokenizer):
     def decode_index(self, x: torch.Tensor) -> torch.Tensor:
         code = self.bsq.decode_index(x)
         x_hat = self.decoder(code)
+        x_hat = x_hat[:, :, :100, :150]
         return x_hat.permute(0, 2, 3, 1).contiguous()
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
@@ -120,7 +128,6 @@ class BSQPatchAutoEncoder(PatchAutoEncoder, Tokenizer):
         zq = self.bsq.encode(z)
         x_hat = self.decoder(self.bsq.decode(zq))
         x_hat = x_hat.permute(0, 2, 3, 1).contiguous()
-
         x_hat = x_hat[:, :x.shape[2], :x.shape[3], :]
 
         with torch.no_grad():
