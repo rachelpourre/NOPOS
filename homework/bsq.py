@@ -2,176 +2,102 @@ import abc
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import gc
-from torch.utils.checkpoint import checkpoint
 from .ae import PatchAutoEncoder
-
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.set_float32_matmul_precision("medium")
-
-def load() -> torch.nn.Module:
-    from pathlib import Path
-
-    model_name = "BSQPatchAutoEncoder"
-    model_path = Path(__file__).parent / f"{model_name}.pth"
-    print(f"Loading {model_name} from {model_path}")
-    return torch.load(model_path, weights_only=False)
 
 
 def diff_sign(x: torch.Tensor) -> torch.Tensor:
-    """
-    A differentiable sign function using the straight-through estimator.
-    Returns -1 for negative values and 1 for non-negative values.
-    """
+    """Differentiable sign with straight-through estimator."""
     sign = 2 * (x >= 0).float() - 1
     return x + (sign - x).detach()
 
 
 class Tokenizer(abc.ABC):
-    """
-    Base class for all tokenizers.
-    Implement a specific tokenizer below.
-    """
-
     @abc.abstractmethod
-    def encode_index(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Tokenize an image tensor of shape (B, H, W, C) into
-        an integer tensor of shape (B, h, w) where h * patch_size = H and w * patch_size = W
-        """
-
+    def encode_index(self, x: torch.Tensor) -> torch.Tensor: ...
     @abc.abstractmethod
-    def decode_index(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Decode a tokenized image into an image tensor.
-        """
+    def decode_index(self, x: torch.Tensor) -> torch.Tensor: ...
 
 
-class BSQ(torch.nn.Module):
+class BSQ(nn.Module):
+    """Binary Sign Quantization layer."""
     def __init__(self, codebook_bits: int, embedding_dim: int):
         super().__init__()
-        self._codebook_bits = codebook_bits
+        self.codebook_bits = codebook_bits
         self.embedding_dim = embedding_dim
+        self.down = nn.Linear(embedding_dim, codebook_bits, bias=False)
+        self.up = nn.Linear(codebook_bits, embedding_dim, bias=False)
 
-        self.down = nn.Linear(embedding_dim, codebook_bits)
-        self.up = nn.Linear(codebook_bits, embedding_dim)
-
+    @torch.cuda.amp.autocast()
     def encode(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Implement the BSQ encoder:
-        - A linear down-projection into codebook_bits dimensions
-        - L2 normalization
-        - differentiable sign
-        """
-        x_proj = self.down(x)
-        x_norm = F.normalize(x_proj, dim=-1)
-        return diff_sign(x_norm)
+        x = self.down(x)
+        x = F.normalize(x, dim=-1)
+        x = diff_sign(x)
+        return x
 
+    @torch.cuda.amp.autocast()
     def decode(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Implement the BSQ decoder:
-        - A linear up-projection into embedding_dim should suffice
-        """
         return self.up(x)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.decode(self.encode(x))
 
+    # --- Bitwise index helpers ---
+    def _code_to_index(self, x: torch.Tensor) -> torch.Tensor:
+        # Convert -1/1 bits to integers
+        bits = (x >= 0).int()
+        return (bits * (2 ** torch.arange(self.codebook_bits, device=x.device))).sum(dim=-1)
+
+    def _index_to_code(self, x: torch.Tensor) -> torch.Tensor:
+        return 2 * ((x[..., None] & (2 ** torch.arange(self.codebook_bits, device=x.device))) > 0).float() - 1
+
     def encode_index(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Run BQS and encode the input tensor x into a set of integer tokens
-        """
         return self._code_to_index(self.encode(x))
 
     def decode_index(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Decode a set of integer tokens into an image.
-        """
         return self.decode(self._index_to_code(x))
 
-    def _code_to_index(self, x: torch.Tensor) -> torch.Tensor:
-        x = (x >= 0).int()
-        return (x * 2 ** torch.arange(x.size(-1)).to(x.device)).sum(dim=-1)
-
-    def _index_to_code(self, x: torch.Tensor) -> torch.Tensor:
-        return 2 * ((x[..., None] & (2 ** torch.arange(self._codebook_bits).to(x.device))) > 0).float() - 1
-
-
 class BSQPatchAutoEncoder(PatchAutoEncoder, Tokenizer):
-    """
-    Combine your PatchAutoEncoder with BSQ to form a Tokenizer.
-
-    Hint: The hyper-parameters below should work fine, no need to change them
-          Changing the patch-size of codebook-size will complicate later parts of the assignment.
-    """
-
-    def __init__(self, patch_size: int = 15, latent_dim: int = 128, codebook_bits: int = 10):
+    def __init__(self, patch_size: int = 5, latent_dim: int = 128, codebook_bits: int = 10):
         super().__init__(patch_size=patch_size, latent_dim=latent_dim)
         self.codebook_bits = codebook_bits
-        self.bsq = BSQ(codebook_bits=codebook_bits, embedding_dim=latent_dim)
+        self.bsq = BSQ(codebook_bits, latent_dim)
 
+    @torch.no_grad()
     def encode_index(self, x: torch.Tensor) -> torch.Tensor:
-        z = self.encode(x)         
-        codes = self.bsq.encode(z) 
-        tokens = self.bsq._code_to_index(codes) 
+        with torch.cuda.amp.autocast():
+            latent = self.encoder(x)
+            tokens = self.bsq.encode_index(latent)
         return tokens
 
+    @torch.no_grad()
     def decode_index(self, x: torch.Tensor) -> torch.Tensor:
-        codes = self.bsq._index_to_code(x) 
-        z_hat = self.bsq.decode(codes)     
-        img = self.decode(z_hat)           
-        return img
+        with torch.cuda.amp.autocast():
+            code = self.bsq.decode_index(x)
+            recon = self.decoder(code)
+        return recon
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
-        return self.bsq.encode(checkpoint(super().encode, x, use_reentrant=False))
+        latent = self.encoder(x)
+        return self.bsq.encode(latent)
 
     def decode(self, x: torch.Tensor) -> torch.Tensor:
-        return super().decode(self.bsq.decode(x))
+        decoded = self.bsq.decode(x)
+        return self.decoder(decoded)
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        """
-        Return the reconstructed image and a dictionary of additional loss terms you would like to
-        minimize (or even just visualize).
-        Hint: It can be helpful to monitor the codebook usage with
+    def forward(self, x: torch.Tensor):
+        """Reconstruct + monitor codebook usage."""
+        latent = self.encoder(x)
+        code = self.bsq.encode(latent)
+        recon = self.decoder(self.bsq.decode(code))
 
-              cnt = torch.bincount(self.encode_index(x).flatten(), minlength=2**self.codebook_bits)
+        # Optional diagnostics: monitor code usage
+        with torch.no_grad():
+            idx = self.bsq._code_to_index(code)
+            cnt = torch.bincount(idx.flatten(), minlength=2 ** self.codebook_bits)
+            stats = {
+                "cb0": (cnt == 0).float().mean(),
+                "cb2": (cnt <= 2).float().mean(),
+                "entropy": (-((cnt / cnt.sum() + 1e-8) * torch.log2(cnt / cnt.sum() + 1e-8))).sum(),
+            }
 
-              and returning
-
-              {
-                "cb0": (cnt == 0).float().mean().detach(),
-                "cb2": (cnt <= 2).float().mean().detach(),
-                ...
-              }
-        """
-        is_train = self.training
-        try:
-            if not is_train:
-                # ⚡ Disable grad during validation to save VRAM
-                with torch.no_grad():
-                    z = checkpoint(super().encode, x, use_reentrant=False)
-                    z_q = self.bsq.encode(z)
-                    recon = super().decode(self.bsq.decode(z_q))
-            else:
-                z = checkpoint(super().encode, x, use_reentrant=False)
-                z_q = self.bsq.encode(z)
-                recon = super().decode(self.bsq.decode(z_q))
-
-            torch.cuda.empty_cache()  # <-- Add this line
-            return recon, {}
-        finally:
-            torch.cuda.empty_cache()
-
-    def on_validation_epoch_end(self):
-        torch.cuda.empty_cache()
-
-    def on_validation_epoch_end(self):
-        _free_gpu_memory()
-
-def _free_gpu_memory():
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        torch.cuda.ipc_collect()
-
-_free_gpu_memory()
+        return recon, stats
