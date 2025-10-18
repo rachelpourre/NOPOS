@@ -1,9 +1,11 @@
 from pathlib import Path
 from typing import cast
+import struct
 
 import numpy as np
 import torch
 from PIL import Image
+import io
 
 from .autoregressive import Autoregressive
 from .bsq import Tokenizer
@@ -21,14 +23,50 @@ class Compressor:
 
         Use arithmetic coding.
         """
-        raise NotImplementedError()
+        raise NotImplementedError
 
     def decompress(self, x: bytes) -> torch.Tensor:
         """
         Decompress a tensor into a PIL image.
         You may assume the output image is 150 x 100 pixels.
         """
-        raise NotImplementedError()
+        raise NotImplementedError
+
+    def _arithmetic_encode(self, tokens, probs):
+        low, high = 0.0, 1.0
+        for token, p in zip(tokens, probs):
+            cdf = np.cumsum(p) / np.sum(p)
+            cdf = np.concatenate(([0.0], cdf))
+            low_, high_ = cdf[token], cdf[token + 1]
+            range_ = high - low
+            high = low + range_ * high_
+            low = low + range_ * low_
+        buf = io.BytesIO()
+        buf.write(struct.pack("d", (low + high) / 2))
+        return buf.getvalue()
+
+    def _arithmetic_decode(self, bitstream, num_tokens, codebook_bits):
+        value = struct.unpack("d", bitstream[:8])[0]
+        tokens = []
+        low, high = 0.0, 1.0
+        vocab_size = 2 ** codebook_bits
+        probs = np.ones(vocab_size) / vocab_size 
+
+        for _ in range(num_tokens):
+            cdf = np.cumsum(probs)
+            cdf /= cdf[-1]
+            cdf = np.concatenate(([0.0], cdf))
+            for i in range(vocab_size):
+                if low + (high - low) * cdf[i] <= value < low + (high - low) * cdf[i + 1]:
+                    token = i
+                    break
+            tokens.append(token)
+            low_, high_ = cdf[token], cdf[token + 1]
+            range_ = high - low
+            high = low + range_ * high_
+            low = low + range_ * low_
+
+        return np.array(tokens, dtype=np.uint16)
 
 
 def compress(tokenizer: Path, autoregressive: Path, image: Path, compressed_image: Path):
