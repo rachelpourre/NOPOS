@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# Buddy gen AI for the debugging
 
 def load() -> torch.nn.Module:
     from pathlib import Path
@@ -70,9 +71,6 @@ class Autoregressive(abc.ABC):
         return logits, {}
 
     def generate(self, B: int = 1, h: int = 20, w: int = 30, device=None) -> torch.Tensor:  # noqa
-        """
-        Use your generative model to produce B new token images of size (B, h, w) and type (int/long).
-        """
         if device is None:
             device = next(self.parameters()).device
         x = torch.zeros((B, h, w), dtype=torch.long, device=device)
@@ -87,17 +85,6 @@ class Autoregressive(abc.ABC):
 
 
 class AutoregressiveModel(torch.nn.Module, Autoregressive):
-    """
-    Implement an auto-regressive model.
-    The input is a set of patch tokens (integers), the output is an image of probability.
-    You need to implicitly shift your inputs by one position in the forward pass.
-    Make sure n_tokens matches your BSQ dimension (2**codebook_bits_).
-
-    Hint: You will need the torch.nn.Embedding function
-    Hint: You can use torch.nn.TransformerEncoderLayer if you'd like
-    Hint: You can complete this homework without using positional embeddings
-    """
-
     def __init__(self, d_latent: int = 128, n_tokens: int = 2**10):
         super().__init__()
         self.n_tokens = n_tokens
@@ -112,28 +99,26 @@ class AutoregressiveModel(torch.nn.Module, Autoregressive):
             batch_first=True,
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=4)
-
         self.to_logits = nn.Linear(d_latent, n_tokens)
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         B, H, W = x.shape
         seq_len = H * W
-
         x = x.view(B, seq_len)
 
         emb = self.embedding(x)  
 
-        start_token = torch.zeros(B, 1, self.d_latent, device=x.device)
+        start_token = torch.randn(B, 1, self.d_latent, device=x.device) * 0.01
         emb_shifted = torch.cat([start_token, emb[:, :-1, :]], dim=1)
 
         encoded = self.transformer(emb_shifted) 
-
-        logits = self.to_logits(encoded) 
+        logits = self.to_logits(encoded)
         logits = logits.view(B, H, W, self.n_tokens)
-
         return logits, {}
 
-    def generate(self, B: int = 1, h: int = 30, w: int = 20, device=None) -> torch.Tensor: 
+    def generate(
+        self, B: int = 1, h: int = 30, w: int = 20, device=None, temperature: float = 1.0
+    ) -> torch.Tensor:
         if device is None:
             device = next(self.parameters()).device
 
@@ -142,7 +127,7 @@ class AutoregressiveModel(torch.nn.Module, Autoregressive):
         for i in range(h):
             for j in range(w):
                 logits, _ = self.forward(x)
-                probs = F.softmax(logits[:, i, j, :], dim=-1)
+                probs = F.softmax(logits[:, i, j, :] / temperature, dim=-1)
                 next_token = torch.multinomial(probs, num_samples=1).squeeze(-1)
                 x[:, i, j] = next_token
 

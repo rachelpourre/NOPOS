@@ -88,8 +88,8 @@ class BSQ(nn.Module):
         return self._code_to_index(self.encode(x))
 
     def decode_index(self, x: torch.Tensor) -> torch.Tensor:
-        code = self._index_to_code(x)  # (B, H, W, codebook_bits)
-        code = code.permute(0, 3, 1, 2).contiguous()  # (B, codebook_bits, H, W)
+        code = self._index_to_code(x) 
+        code = code.permute(0, 3, 1, 2).contiguous()
         return self.decode(code)
 
 
@@ -127,7 +127,7 @@ class BSQPatchAutoEncoder(PatchAutoEncoder, Tokenizer):
         return indices
 
     def decode_index(self, x: torch.Tensor) -> torch.Tensor:
-        if x.ndim == 2:  # single image token map (H,W)
+        if x.ndim == 2: 
             x = x.unsqueeze(0)
             squeeze_batch = True
         else:
@@ -135,7 +135,6 @@ class BSQPatchAutoEncoder(PatchAutoEncoder, Tokenizer):
 
         code = self.bsq.decode_index(x)
         x_hat = self.decoder(code)
-        # Optional: crop to expected size (replace with dynamic shape if you like)
         x_hat = x_hat[:, :, :100, :150]
         x_hat = x_hat.permute(0, 2, 3, 1).contiguous()
 
